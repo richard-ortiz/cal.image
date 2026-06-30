@@ -1,0 +1,1583 @@
+```{r helpers, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+
+# =============================================================================
+# Calcium Imaging — Droplet Selector
+# =============================================================================
+# Run with:  shiny::runApp("calcium_bubble_selector.R")
+# Requires:  install.packages(c("shiny", "ggplot2", "dplyr", "DT"))
+# =============================================================================
+
+library(shiny)
+library(ggplot2)
+library(dplyr)
+library(DT)
+
+# ── helpers ───────────────────────────────────────────────────────────────────
+
+parse_calcium_csv <- function(path) {
+  lines <- readLines(path)
+  header_idx  <- which(grepl("Field#", lines))[1]
+  summary_idx <- which(grepl("Summary Statistics", lines, ignore.case = TRUE))[1]
+  end_idx     <- if (!is.na(summary_idx)) summary_idx - 1 else length(lines)
+  data_lines  <- lines[(header_idx + 1):end_idx]
+  data_lines  <- data_lines[nzchar(trimws(data_lines))]
+  rows <- lapply(data_lines, function(l) {
+    parts <- strsplit(l, ",")[[1]]
+    parts <- parts[nzchar(trimws(parts))]
+    if (length(parts) >= 2) {
+      frame <- suppressWarnings(as.numeric(parts[1]))
+      val   <- suppressWarnings(as.numeric(parts[2]))
+      if (!is.na(frame) && !is.na(val)) return(c(frame, val))
+    }
+    NULL
+  })
+  rows <- rows[!sapply(rows, is.null)]
+  m    <- do.call(rbind, rows)
+  data.frame(frame = m[, 1], intensity = m[, 2])
+}
+
+auto_detect_oxygen <- function(df) {
+  vals   <- df$intensity
+  frames <- df$frame
+  n      <- length(vals)
+  diffs  <- c(0, diff(vals))
+  pos_diffs <- diffs[diffs > 0]
+  if (length(pos_diffs) == 0)
+    return(data.frame(start_frame=numeric(0), end_frame=numeric(0)))
+  p99       <- quantile(pos_diffs, 0.99)
+  threshold <- max(10 * p99, 50)
+  raw_starts <- which(diffs > threshold)
+  if (length(raw_starts) == 0)
+    return(data.frame(start_frame=numeric(0), end_frame=numeric(0)))
+  starts <- raw_starts[1]
+  for (i in seq_along(raw_starts)[-1])
+    if (raw_starts[i] - tail(starts, 1) > 5) starts <- c(starts, raw_starts[i])
+  bubbles <- lapply(starts, function(si) {
+    pre_val   <- vals[max(1, si - 1)]
+    end_idx   <- min(si + 400, n)
+    for (j in seq(si + 1, min(si + 400, n)))
+      if (vals[j] <= pre_val * 1.15) { end_idx <- j - 1; break }
+    data.frame(start_frame = frames[si], end_frame = frames[end_idx])
+  })
+  do.call(rbind, bubbles)
+}
+
+auto_assign_phases <- function(drops, n_pre=7, n_stim=1) {
+  if (nrow(drops) == 0) return(drops)
+  drops_sorted <- drops[order(drops$start_frame), ]
+  n <- nrow(drops_sorted)
+  phases <- character(n)
+  for (i in seq_len(n)) {
+    if (i <= n_pre)            phases[i] <- "pre"
+    else if (i <= n_pre + n_stim) phases[i] <- "stim"
+    else                       phases[i] <- "post"
+  }
+  drops_sorted$phase <- phases
+  # re-merge back in original order
+  drops$phase <- phases[match(drops$id, drops_sorted$id)]
+  drops
+}
+
+phase_color <- function(phase) {
+  switch(phase,
+    pre      = "#185FA5",   # blue
+    stim     = "#c47d00",   # amber
+    post     = "#27ae60",   # green
+    excluded = "#aaaaaa",   # grey
+    "#993556"               # fallback
+  )
+}
+
+phase_fill <- function(phase) {
+  switch(phase,
+    pre      = "rgba(24,95,165,0.18)",
+    stim     = "rgba(196,125,0,0.22)",
+    post     = "rgba(39,174,96,0.18)",
+    excluded = "rgba(170,170,170,0.12)",
+    "rgba(153,53,86,0.22)"
+  )
+}
+
+remove_oxygen <- function(df, oxy_df) {
+  if (is.null(oxy_df) || nrow(oxy_df) == 0) return(df)
+  keep <- rep(TRUE, nrow(df))
+  for (i in seq_len(nrow(oxy_df)))
+    keep <- keep & !(df$frame >= oxy_df$start_frame[i] &
+                     df$frame <= oxy_df$end_frame[i])
+  df[keep, ]
+}
+
+# ── JavaScript ────────────────────────────────────────────────────────────────
+# Controls:
+#   Left-click drag  → Shiny brush (region selection) — native, no JS needed
+#   Right-click drag → pan left/right
+#   Scroll wheel     → zoom in/out centred on cursor
+#   Spacebar         → add current brush selection as a droplet region
+#   Escape           → clear brush / deselect current drop
+
+nav_js <- HTML('
+<script>
+var CA = {
+  minF:1, maxF:1, viewLo:1, viewHi:1,
+  panning:false,
+  panStartX:0, panStartLo:0, panStartHi:0,
+  marginLeft:60, marginRight:20,
+  hasBrush: false    // track whether a brush selection exists
+};
+
+window.caInit = function(mn,mx,lo,hi){
+  CA.minF=mn; CA.maxF=mx; CA.viewLo=lo; CA.viewHi=hi;
+};
+
+function pushRange(){
+  Shiny.setInputValue("js_view",
+    {lo:Math.round(CA.viewLo), hi:Math.round(CA.viewHi)},
+    {priority:"event"});
+}
+
+function applyView(lo,hi){
+  var span=hi-lo; if(span<20){hi=lo+20;}
+  if(lo<CA.minF){lo=CA.minF; hi=lo+span;}
+  if(hi>CA.maxF){hi=CA.maxF; lo=hi-span;}
+  if(lo<CA.minF) lo=CA.minF;
+  if(hi>CA.maxF) hi=CA.maxF;
+  CA.viewLo=lo; CA.viewHi=hi; pushRange();
+}
+
+function xToFrame(clientX){
+  var el=document.getElementById("plot_main"); if(!el) return CA.viewLo;
+  var rect=el.getBoundingClientRect();
+  var plotW=rect.width-CA.marginLeft-CA.marginRight;
+  var frac=(clientX-rect.left-CA.marginLeft)/plotW;
+  return CA.viewLo+Math.max(0,Math.min(1,frac))*(CA.viewHi-CA.viewLo);
+}
+
+// Update the hint bar text
+function setHint(txt){
+  var h=document.getElementById("hint_bar"); if(h) h.textContent=txt;
+}
+
+$(document).ready(function(){
+
+  Shiny.addCustomMessageHandler("caInit",function(m){
+    window.caInit(m.mn,m.mx,m.lo,m.hi);
+  });
+  // Called by R when brush is cleared after adding a region
+  Shiny.addCustomMessageHandler("clearBrush",function(m){
+    CA.hasBrush=false;
+    setHint("Left-drag to select a region  ·  Space to add  ·  Right-drag to pan  ·  Scroll to zoom");
+  });
+
+  // ── Keyboard shortcuts ─────────────────────────────────────────────────
+  $(document).on("keydown",function(e){
+    if(e.target.tagName==="INPUT"||e.target.tagName==="TEXTAREA") return;
+
+    // Space → add droplet (only if a brush exists)
+    if(e.key===" "||e.keyCode===32){
+      e.preventDefault();
+      Shiny.setInputValue("space_add",Date.now(),{priority:"event"});
+      return;
+    }
+    // Escape → clear selection / deselect editing drop
+    if(e.key==="Escape"){
+      e.preventDefault();
+      Shiny.setInputValue("escape_key",Date.now(),{priority:"event"});
+      return;
+    }
+  });
+
+  // ── Scroll to zoom ─────────────────────────────────────────────────────
+  $("#plot_wrap").on("wheel",function(e){
+    e.preventDefault();
+    var oe=e.originalEvent;
+    var factor=oe.deltaY>0?1.18:0.85;
+    var mouseF=xToFrame(oe.clientX);
+    var span=CA.viewHi-CA.viewLo;
+    var newSpan=Math.max(20,Math.min(CA.maxF-CA.minF,span*factor));
+    var ratio=span>0?(mouseF-CA.viewLo)/span:0.5;
+    applyView(mouseF-ratio*newSpan, mouseF-ratio*newSpan+newSpan);
+  });
+
+  // ── Right-click drag to pan ────────────────────────────────────────────
+  // Use the transparent overlay for right-click so we don\'t block Shiny\'s
+  // left-button brush. The overlay is always present but pointer-events
+  // are set to none for left clicks so Shiny brush still works underneath.
+  var wrap = document.getElementById("plot_wrap");
+
+  wrap.addEventListener("mousedown",function(e){
+    if(e.button!==2) return;   // right button only
+    e.preventDefault();
+    CA.panning=true;
+    CA.panStartX=e.clientX;
+    CA.panStartLo=CA.viewLo;
+    CA.panStartHi=CA.viewHi;
+    wrap.style.cursor="grabbing";
+  });
+
+  document.addEventListener("mousemove",function(e){
+    if(!CA.panning) return;
+    var el=document.getElementById("plot_main"); if(!el) return;
+    var rect=el.getBoundingClientRect();
+    var plotW=rect.width-CA.marginLeft-CA.marginRight;
+    if(plotW<=0) return;
+    var span=CA.panStartHi-CA.panStartLo;
+    var dFrame=-((e.clientX-CA.panStartX)/plotW)*span;
+    applyView(CA.panStartLo+dFrame, CA.panStartHi+dFrame);
+  });
+
+  document.addEventListener("mouseup",function(e){
+    if(!CA.panning) return;
+    CA.panning=false;
+    wrap.style.cursor="crosshair";
+  });
+
+  // Suppress the browser context menu on the plot so right-click drag works cleanly
+  wrap.addEventListener("contextmenu",function(e){ e.preventDefault(); });
+
+  window.addEventListener("blur",function(){ CA.panning=false; });
+
+  // Track whether brush has been drawn (to show/hide hint)
+  // Shiny fires a brushed event on the plot — we watch for any mouse-up after
+  // a left-drag on the plot to flag that a selection may exist
+  var leftDown=false;
+  wrap.addEventListener("mousedown",function(e){
+    if(e.button===0) leftDown=true;
+  });
+  document.addEventListener("mouseup",function(e){
+    if(leftDown && e.button===0){
+      leftDown=false;
+      // small delay so Shiny has time to update input$brush
+      setTimeout(function(){
+        CA.hasBrush=true;
+        setHint("Selection ready — press Space to add as droplet  ·  or drag again to redraw");
+      },150);
+    }
+  });
+
+});
+</script>
+')
+
+# ── UI ────────────────────────────────────────────────────────────────────────
+
+ui <- fluidPage(
+  tags$head(
+    tags$style(HTML("
+      body { font-family:'Helvetica Neue',sans-serif; font-size:13px; }
+      .well { padding:12px; background:#f8f8f8; border:1px solid #e0e0e0; }
+      .btn-primary { background-color:#2c6fad; border-color:#2c6fad; }
+      .btn-danger  { background-color:#c0392b; border-color:#c0392b; }
+      .btn-success { background-color:#27ae60; border-color:#27ae60; }
+      .btn-warning { background-color:#e67e22; border-color:#e67e22; color:white; }
+      h4 { margin-top:4px; margin-bottom:8px; font-weight:500; }
+      #plot_wrap { position:relative; display:block; width:100%;
+                   cursor:crosshair; user-select:none; }
+      #plot_main { display:block; width:100%; }
+      .oxy-pill      { background:#ba7517; color:white; padding:1px 7px;
+                       border-radius:3px; font-size:11px; font-weight:500; }
+      .drop-pill     { background:#993556; color:white; padding:1px 7px;
+                       border-radius:3px; font-size:11px; font-weight:500; }
+      .phase-pre     { background:#185FA5; }
+      .phase-stim    { background:#c47d00; }
+      .phase-post    { background:#27ae60; }
+      .phase-excl    { background:#aaaaaa; }
+      .hint-bar  { background:#e8f0fb; border-left:3px solid #2c6fad;
+                   padding:6px 12px; font-size:12px; color:#2c4a7a;
+                   margin-bottom:8px; border-radius:0 4px 4px 0; }
+      .legend-row { display:flex; gap:16px; font-size:12px; color:#555;
+                    margin-bottom:6px; align-items:center; }
+      .leg-swatch { width:12px; height:12px; border-radius:2px; display:inline-block;
+                    margin-right:4px; vertical-align:middle; }
+      /* region table */
+      .drop-row { cursor:pointer; transition:background 0.1s; }
+      .drop-row:hover { background:#fdf0f5; }
+      .drop-row.selected { background:#f5d6e4 !important; }
+      /* prevent DataTable from stealing spacebar focus */
+      .dataTables_wrapper { outline: none; }
+      table.dataTable { outline: none; }
+      table.dataTable td, table.dataTable th { outline: none; }
+      /* edit panel */
+      .edit-panel { background:#fdf0f5; border:1.5px solid #d88aaa;
+                    border-radius:6px; padding:12px 14px; margin-top:10px; }
+      .edit-panel .edit-title { font-weight:500; color:#6b1f3a;
+                                font-size:13px; margin-bottom:6px; }
+      .edit-panel .edit-hint  { font-size:11px; color:#777; margin-bottom:10px; }
+      .edit-frames { font-size:13px; font-family:monospace; color:#444;
+                     background:#fff; border:1px solid #d88aaa; border-radius:4px;
+                     padding:4px 10px; margin-bottom:10px; display:inline-block; }
+    ")),
+    nav_js
+  ),
+
+  titlePanel("Calcium Imaging — Droplet Selector"),
+
+  sidebarLayout(
+    sidebarPanel(width = 3,
+
+      wellPanel(
+        h4("1. Load data"),
+        fileInput("file", NULL, accept = ".csv",
+                  buttonLabel = "Browse…", placeholder = "No file selected"),
+        checkboxInput("auto_oxy", "Auto-remove oxygen bubbles", value = TRUE),
+        uiOutput("oxy_status")
+      ),
+
+      conditionalPanel("output.data_loaded",
+        wellPanel(
+          h4("2. Navigate"),
+          tags$p(style="font-size:11px;color:#555;line-height:1.6;margin:0;",
+            HTML("🖱 <b>Left-drag</b> — draw selection<br>
+                  🖱 <b>Right-drag</b> — pan left/right<br>
+                  🖱 <b>Scroll</b> — zoom in/out<br>
+                  ⌨ <b>Space</b> — add selection as droplet<br>
+                  ⌨ <b>Esc</b> — cancel / deselect")),
+          br(),
+          actionButton("reset_zoom","⟳ Reset zoom", width="100%",
+                       class="btn btn-default btn-sm")
+        ),
+
+        wellPanel(
+          h4("3. Mark droplets / media"),
+          tags$p(style="font-size:11px;color:#777;margin-bottom:8px;",
+            "Drag to select, then press Space or click Add:"),
+          actionButton("add_region","✚ Add droplet",
+                       class="btn-primary", width="100%"),
+          br(), br(),
+          actionButton("undo_last","↩ Undo last",          class="btn-warning", width="100%"),
+          br(), br(),
+          actionButton("clear_drops","✕ Clear all",          class="btn-danger",  width="100%")
+        ),
+
+        wellPanel(
+          h4("4. Export"),
+          tags$p(style="font-size:11px;color:#777;margin-bottom:6px;",
+            "Exports only your marked regions. Original frame numbers preserved."),
+          downloadButton("dl_cleaned","Download marked regions CSV", class="btn-success"),
+          br(), br(),
+          downloadButton("dl_regions","Download region table",        class="btn-success")
+        )
+      )
+    ),
+
+    mainPanel(width = 9,
+      conditionalPanel("!output.data_loaded",
+        div(style="background:#eaf3de;border-left:3px solid #3b6d11;
+                   padding:8px 12px;font-size:12px;",
+            "👆 Upload a CSV file exported from ImageJ/FIJI Field Data to get started.")
+      ),
+
+      conditionalPanel("output.data_loaded",
+        tabsetPanel(id="main_tabs",
+
+          # ── Tab 1: Selector ──────────────────────────────────────────────
+          tabPanel("Droplet Selector",
+
+            br(),
+
+            # Hint bar + view info
+            fluidRow(
+              column(8,
+                div(class="hint-bar", id="hint_bar",
+                  "Left-drag to select a region  ·  Space to add  ·  Right-drag to pan  ·  Scroll to zoom")
+              ),
+              column(4, style="text-align:right; padding-top:4px;",
+                uiOutput("view_info"))
+            ),
+
+            # Legend
+            div(class="legend-row",
+              tags$span(
+                tags$span(class="leg-swatch",
+                  style="background:rgba(186,117,23,0.35);border:1px solid #ba7517;"),
+                "O\u2082 (removed)"),
+              tags$span(
+                tags$span(class="leg-swatch",
+                  style="background:rgba(24,95,165,0.35);border:1px solid #185FA5;"),
+                "Pre-stim"),
+              tags$span(
+                tags$span(class="leg-swatch",
+                  style="background:rgba(196,125,0,0.35);border:1px solid #c47d00;"),
+                "Stimulus"),
+              tags$span(
+                tags$span(class="leg-swatch",
+                  style="background:rgba(39,174,96,0.35);border:1px solid #27ae60;"),
+                "Post-stim"),
+              tags$span(
+                tags$span(class="leg-swatch",
+                  style="background:rgba(170,170,170,0.35);border:1px solid #aaa;"),
+                "Excluded"),
+              tags$span(style="color:#888;font-size:11px;margin-left:8px;",
+                "— click a phase pill in the table to cycle its label")
+            ),
+
+            # Plot
+            div(id="plot_wrap",
+              plotOutput("plot_main", height="360px",
+                         brush=brushOpts(id="brush", direction="x",
+                                         resetOnNew=TRUE, opacity=0.15))
+            ),
+
+            hr(),
+
+            fluidRow(column(12,
+              h4("Marked droplet regions  —  click a row to edit"),
+              uiOutput("region_table_ui"),
+              br()
+            )),
+
+            fluidRow(column(12,
+              h4("Per-region summary"),
+              DTOutput("summary_table")
+            ))
+          ),
+
+          # ── Tab 2: Cleaned data preview ──────────────────────────────────
+          tabPanel("Cleaned Data Preview",
+
+            br(),
+
+            conditionalPanel(
+              "output.has_drops",
+              div(class="legend-row",
+                tags$span(
+                  tags$span(class="leg-swatch",
+                    style="background:rgba(24,95,165,0.5);border:1px solid #185FA5;"),
+                  "Pre-stim"),
+                tags$span(
+                  tags$span(class="leg-swatch",
+                    style="background:rgba(196,125,0,0.5);border:1px solid #c47d00;"),
+                  "Stimulus"),
+                tags$span(
+                  tags$span(class="leg-swatch",
+                    style="background:rgba(39,174,96,0.5);border:1px solid #27ae60;"),
+                  "Post-stim"),
+                tags$span(style="color:#888;font-size:11px;margin-left:8px;",
+                  "— excluded droplets and non-droplet frames are hidden")
+              ),
+              plotOutput("plot_cleaned", height="400px"),
+              hr(),
+              tags$p(style="font-size:11px;color:#888;margin-bottom:4px;",
+                "This is exactly what will be exported to CSV (frame-by-frame intensity for included droplets only)."),
+              DTOutput("cleaned_table")
+            ),
+
+            conditionalPanel(
+              "!output.has_drops",
+              div(style="background:#f5f5f5;border-left:3px solid #ccc;
+                         padding:10px 14px;font-size:12px;color:#777;margin-top:10px;",
+                "No droplets marked yet — go to the Droplet Selector tab to mark regions.")
+            )
+          ),
+
+          # ── Tab 3: Decay regression ──────────────────────────────────────
+          tabPanel("Decay Regression",
+
+            br(),
+
+            conditionalPanel("output.has_drops",
+
+              fluidRow(
+                column(4,
+                  wellPanel(
+                    h4("Select droplets for fit"),
+                    tags$p(style="font-size:11px;color:#777;margin-bottom:8px;",
+                      "Check the droplets to include in the one-phase decay fit.
+                       Tip: typically pre-stim + last post-stim."),
+                    uiOutput("decay_drop_picker"),
+                    br(),
+                    actionButton("run_decay", "▶ Run one-phase decay",
+                                 class="btn-primary", width="100%")
+                  )
+                ),
+                column(8,
+                  uiOutput("decay_results_ui")
+                )
+              )
+            ),
+
+            conditionalPanel("!output.has_drops",
+              div(style="background:#f5f5f5;border-left:3px solid #ccc;
+                         padding:10px 14px;font-size:12px;color:#777;margin-top:10px;",
+                "No droplets marked yet — go to the Droplet Selector tab to mark regions.")
+            )
+          ),
+
+          # ── Tab 4: SBR Analysis ──────────────────────────────────────────
+          tabPanel("SBR Analysis",
+
+            br(),
+
+            conditionalPanel("output.has_decay",
+
+              fluidRow(
+                column(3,
+                  wellPanel(
+                    h4("SBR settings"),
+                    tags$p(style="font-size:11px;color:#777;margin-bottom:8px;",
+                      "Select which droplets to include in the background
+                       (pre-stim) and which to plot as signal."),
+                    uiOutput("sbr_prestim_picker"),
+                    hr(),
+                    uiOutput("sbr_signal_picker"),
+                    br(),
+                    actionButton("run_sbr", "▶ Compute SBR",
+                                 class="btn-primary", width="100%")
+                  )
+                ),
+                column(9,
+                  uiOutput("sbr_results_ui")
+                )
+              )
+            ),
+
+            conditionalPanel("!output.has_decay",
+              div(style="background:#f5f5f5;border-left:3px solid #ccc;
+                         padding:10px 14px;font-size:12px;color:#777;margin-top:10px;",
+                "Run the one-phase decay fit first (Decay Regression tab) before computing SBR.")
+            )
+          ),
+
+          # ── Tab 5: SBR Boxplot ────────────────────────────────────────────
+          tabPanel("SBR Boxplot",
+
+            br(),
+
+            conditionalPanel("output.has_sbr",
+              plotOutput("sbr_boxplot", height="450px"),
+              br(),
+              h4("Wilcoxon rank-sum tests vs Stimulus"),
+              tags$p(style="font-size:11px;color:#777;margin-bottom:6px;",
+                "Each droplet compared to the stimulus droplet. p-values adjusted with Benjamini-Hochberg (FDR)."),
+              DTOutput("sbr_stats_table"),
+              br(),
+              downloadButton("dl_sbr_plot",  "Download plot (PNG)", class="btn-success"),
+              tags$span(style="display:inline-block;width:10px;"),
+              downloadButton("dl_sbr_stats", "Download stats CSV",  class="btn-success")
+            ),
+
+            conditionalPanel("!output.has_sbr",
+              div(style="background:#f5f5f5;border-left:3px solid #ccc;
+                         padding:10px 14px;font-size:12px;color:#777;margin-top:10px;",
+                "Run the SBR Analysis first before viewing the boxplot.")
+            )
+          )
+        )
+      )
+    )
+  )
+)
+
+# ── Server ────────────────────────────────────────────────────────────────────
+
+server <- function(input, output, session) {
+
+  rv <- reactiveValues(
+    df          = NULL,
+    oxy_df      = NULL,
+    frame_min   = 1, frame_max = 1,
+    view_lo     = 1, view_hi   = 1,
+    selected_id = NULL,
+    drops       = data.frame(
+      id=integer(0), start_frame=numeric(0),
+      end_frame=numeric(0), n_frames=integer(0),
+      phase=character(0),
+      stringsAsFactors=FALSE
+    ),
+    next_id = 1L
+  )
+
+  # ── Load file ──────────────────────────────────────────────────────────────
+  observeEvent(input$file, {
+    req(input$file)
+    df <- tryCatch(parse_calcium_csv(input$file$datapath), error=function(e) NULL)
+    validate(need(!is.null(df), "Could not parse file. Make sure it is a Field Data CSV."))
+    fmin <- min(df$frame); fmax <- max(df$frame)
+    rv$df <- df; rv$frame_min <- fmin; rv$frame_max <- fmax
+    rv$view_lo <- fmin; rv$view_hi <- fmax
+    rv$drops  <- rv$drops[0,]; rv$next_id <- 1L; rv$selected_id <- NULL
+    rv$oxy_df <- if (isTRUE(input$auto_oxy)) auto_detect_oxygen(df) else
+                   data.frame(start_frame=numeric(0), end_frame=numeric(0))
+    session$sendCustomMessage("caInit", list(mn=fmin,mx=fmax,lo=fmin,hi=fmax))
+  })
+
+  observeEvent(input$auto_oxy, {
+    req(rv$df)
+    rv$oxy_df <- if (isTRUE(input$auto_oxy)) auto_detect_oxygen(rv$df) else
+                   data.frame(start_frame=numeric(0), end_frame=numeric(0))
+  })
+
+  output$data_loaded <- reactive(!is.null(rv$df))
+  outputOptions(output, "data_loaded", suspendWhenHidden=FALSE)
+
+  output$has_drops <- reactive({
+    !is.null(rv$df) && nrow(rv$drops) > 0 &&
+      any(rv$drops$phase != "excluded")
+  })
+  outputOptions(output, "has_drops", suspendWhenHidden=FALSE)
+
+  # ── Decay tab: drop picker ─────────────────────────────────────────────────
+  output$decay_drop_picker <- renderUI({
+    req(rv$drops)
+    d <- rv$drops[rv$drops$phase != "excluded", ]
+    d <- d[order(d$start_frame), ]
+    if (nrow(d) == 0) return(tags$p("No included droplets yet."))
+
+    # default: all pre + last post
+    last_post <- tail(d$id[d$phase == "post"], 1)
+    pre_ids   <- d$id[d$phase == "pre"]
+    default   <- c(pre_ids, last_post)
+
+    checkboxGroupInput(
+      "decay_drop_ids", label = NULL,
+      choiceNames  = lapply(seq_len(nrow(d)), function(i) {
+        r    <- d[i, ]
+        ph   <- r$phase
+        pcol <- phase_color(ph)
+        pill <- switch(ph, pre="Pre-stim", stim="Stimulus", post="Post-stim", ph)
+        tags$span(
+          tags$span(style=sprintf(
+            "background:%s;color:white;padding:1px 6px;border-radius:3px;
+             font-size:11px;font-weight:500;margin-right:6px;", pcol), pill),
+          sprintf("Drop %d  (frames %d–%d)", r$id, r$start_frame, r$end_frame)
+        )
+      }),
+      choiceValues = d$id,
+      selected     = default
+    )
+  })
+
+  # ── Decay fit reactive ─────────────────────────────────────────────────────
+  decay_fit <- eventReactive(input$run_decay, {
+    req(rv$df, input$decay_drop_ids)
+    ids <- as.integer(input$decay_drop_ids)
+    if (length(ids) < 2) return(list(error="Select at least 2 droplets."))
+
+    d  <- rv$drops[rv$drops$id %in% ids, ]
+    df <- rv$df
+    pts <- do.call(rbind, lapply(seq_len(nrow(d)), function(i) {
+      df[df$frame >= d$start_frame[i] & df$frame <= d$end_frame[i], ]
+    }))
+    if (nrow(pts) < 4) return(list(error="Not enough data points to fit."))
+
+    x <- pts$frame
+    y <- pts$intensity
+
+    # one-phase decay: Y = (Y0 - Plateau) * exp(-K * x) + Plateau
+    # K constrained > 0 via lower bound in nls
+    y0_init  <- max(y)
+    pl_init  <- min(y)
+    k_init   <- 0.001
+
+    fit <- tryCatch(
+      nls(y ~ (Y0 - Plateau) * exp(-K * x) + Plateau,
+          start   = list(Y0=y0_init, Plateau=pl_init, K=k_init),
+          lower   = list(Y0=-Inf,    Plateau=-Inf,     K=0),
+          algorithm = "port",
+          control = nls.control(maxiter=1000, warnOnly=TRUE)),
+      error = function(e) e
+    )
+
+    if (inherits(fit, "error"))
+      return(list(error=paste("Fit failed:", conditionMessage(fit))))
+
+    co    <- coef(fit)
+    yhat  <- predict(fit)
+    ss_res <- sum((y - yhat)^2)
+    ss_tot <- sum((y - mean(y))^2)
+    r2    <- 1 - ss_res / ss_tot
+    syx   <- sqrt(ss_res / (length(y) - 3))
+    t_half <- log(2) / co["K"]
+
+    list(
+      fit    = fit,
+      pts    = pts,
+      coef   = co,
+      r2     = r2,
+      syx    = syx,
+      ss_res = ss_res,
+      t_half = t_half,
+      error  = NULL
+    )
+  })
+
+  # ── Decay results UI ──────────────────────────────────────────────────────
+  output$decay_results_ui <- renderUI({
+    res <- decay_fit()
+    if (is.null(res)) return(tags$p(style="color:#888;", "Run the fit to see results."))
+    if (!is.null(res$error))
+      return(div(style="background:#fdecea;border-left:3px solid #c0392b;
+                        padding:10px 14px;font-size:12px;color:#7a1a1a;margin-top:4px;",
+                 res$error))
+    tagList(
+      plotOutput("decay_plot", height="380px"),
+      br(),
+      h4("Fit parameters"),
+      DTOutput("decay_params_table")
+    )
+  })
+
+  output$decay_plot <- renderPlot({
+    res <- decay_fit(); req(res, is.null(res$error))
+    pts  <- res$pts
+    co   <- res$coef
+    xseq <- seq(min(pts$frame), max(pts$frame), length.out=500)
+    yseq <- (co["Y0"] - co["Plateau"]) * exp(-co["K"] * xseq) + co["Plateau"]
+    fit_line <- data.frame(frame=xseq, intensity=yseq)
+
+    # colour points by phase
+    pts$phase <- sapply(pts$frame, function(f) {
+      idx <- which(rv$drops$start_frame <= f & rv$drops$end_frame >= f)
+      if (length(idx) == 0) "pre" else rv$drops$phase[idx[1]]
+    })
+    phase_cols <- c(pre="#185FA5", stim="#c47d00", post="#27ae60")
+
+    ggplot(pts, aes(x=frame, y=intensity, color=phase)) +
+      geom_point(size=1.2, alpha=0.7) +
+      geom_line(data=fit_line, aes(x=frame, y=intensity),
+                color="#e74c3c", linewidth=1.1, inherit.aes=FALSE) +
+      scale_color_manual(values=phase_cols,
+        labels=c(pre="Pre-stim", stim="Stimulus", post="Post-stim"), name=NULL) +
+      theme_minimal(base_size=12) +
+      theme(
+        panel.grid.minor = element_blank(),
+        panel.grid.major = element_line(color="grey92"),
+        axis.title       = element_text(size=11, color="grey40"),
+        legend.position  = "top",
+        plot.title       = element_text(size=12, face="plain", color="grey35")
+      ) +
+      labs(x="Frame #", y="Pixel Intensity",
+           title="One-phase decay fit")
+  }, res=110)
+
+  output$decay_params_table <- renderDT({
+    res <- decay_fit(); req(res, is.null(res$error))
+    co <- res$coef
+    params <- data.frame(
+      Parameter = c("Y0", "Plateau", "K", "Half-life (frames)", "R²", "Sy.x", "SS residual"),
+      Value     = c(
+        round(co["Y0"],      4),
+        round(co["Plateau"], 4),
+        round(co["K"],       6),
+        round(res$t_half,    2),
+        round(res$r2,        5),
+        round(res$syx,       4),
+        round(res$ss_res,    2)
+      )
+    )
+    datatable(params, rownames=FALSE,
+              options=list(dom="t", pageLength=10, ordering=FALSE, tabIndex=-1))
+  })
+
+  output$has_decay <- reactive({
+    res <- tryCatch(decay_fit(), error=function(e) NULL)
+    !is.null(res) && is.null(res$error)
+  })
+  outputOptions(output, "has_decay", suspendWhenHidden=FALSE)
+
+  # ── SBR: pre-stim picker ───────────────────────────────────────────────────
+  output$sbr_prestim_picker <- renderUI({
+    req(rv$drops)
+    pre <- rv$drops[rv$drops$phase == "pre", ]
+    pre <- pre[order(pre$start_frame), ]
+    if (nrow(pre) == 0) return(tags$p("No pre-stim droplets found."))
+    tagList(
+      tags$p(style="font-size:11px;font-weight:600;color:#444;margin-bottom:4px;",
+             "Pre-stim droplets for background:"),
+      checkboxGroupInput("sbr_pre_ids", label=NULL,
+        choiceNames  = lapply(seq_len(nrow(pre)), function(i)
+          sprintf("Drop %d  (frames %d–%d)", pre$id[i], pre$start_frame[i], pre$end_frame[i])),
+        choiceValues = pre$id,
+        selected     = pre$id
+      )
+    )
+  })
+
+  # ── SBR: signal droplet picker ────────────────────────────────────────────
+  output$sbr_signal_picker <- renderUI({
+    req(rv$drops)
+    sig <- rv$drops[rv$drops$phase %in% c("pre","stim","post"), ]
+    sig <- sig[order(sig$start_frame), ]
+    if (nrow(sig) == 0) return(tags$p("No droplets to plot."))
+
+    # defaults: last pre, stim, all post
+    last_pre  <- tail(sig$id[sig$phase == "pre"],  1)
+    stim_ids  <- sig$id[sig$phase == "stim"]
+    post_ids  <- sig$id[sig$phase == "post"]
+    default   <- c(last_pre, stim_ids, post_ids)
+
+    tagList(
+      tags$p(style="font-size:11px;font-weight:600;color:#444;margin-bottom:4px;",
+             "Droplets to plot (signal):"),
+      checkboxGroupInput("sbr_sig_ids", label=NULL,
+        choiceNames = lapply(seq_len(nrow(sig)), function(i) {
+          r    <- sig[i,]
+          ph   <- r$phase
+          pcol <- phase_color(ph)
+          pill <- switch(ph, pre="Pre-stim", stim="Stimulus", post="Post-stim", ph)
+          tags$span(
+            tags$span(style=sprintf(
+              "background:%s;color:white;padding:1px 6px;border-radius:3px;
+               font-size:11px;font-weight:500;margin-right:6px;", pcol), pill),
+            sprintf("Drop %d  (frames %d–%d)", r$id, r$start_frame, r$end_frame)
+          )
+        }),
+        choiceValues = sig$id,
+        selected     = default
+      )
+    )
+  })
+
+  # ── SBR computation ────────────────────────────────────────────────────────
+  sbr_result <- eventReactive(input$run_sbr, {
+    req(rv$df, decay_fit(), input$sbr_pre_ids, input$sbr_sig_ids)
+    res <- decay_fit()
+    if (!is.null(res$error)) return(list(error=res$error))
+
+    co  <- res$coef
+    df  <- rv$df
+    d   <- rv$drops
+
+    # curve value for every frame
+    df$curve <- (co["Y0"] - co["Plateau"]) * exp(-co["K"] * df$frame) + co["Plateau"]
+    df$ratio  <- df$intensity / df$curve
+
+    # helper: get ratio values for a droplet, cropped to min_frames
+    get_ratio <- function(id, min_frames) {
+      r    <- d[d$id == id, ]
+      rows <- df[df$frame >= r$start_frame & df$frame <= r$end_frame, "ratio"]
+      rows[seq_len(min(length(rows), min_frames))]
+    }
+
+    pre_ids <- as.integer(input$sbr_pre_ids)
+    sig_ids <- as.integer(input$sbr_sig_ids)
+
+    # find min frame count across ALL selected droplets (pre + signal)
+    all_ids    <- unique(c(pre_ids, sig_ids))
+    frame_counts <- sapply(all_ids, function(id) {
+      r <- d[d$id == id, ]
+      nrow(df[df$frame >= r$start_frame & df$frame <= r$end_frame, ])
+    })
+    min_frames <- min(frame_counts)
+
+    # build pre-stim matrix (rows = frame position, cols = droplets)
+    pre_mat <- do.call(cbind, lapply(pre_ids, get_ratio, min_frames=min_frames))
+
+    # background = row-wise mean across pre-stim droplets
+    background <- rowMeans(pre_mat, na.rm=TRUE)
+
+    # signal droplets: ratio - background (position-matched)
+    sig_list <- lapply(sig_ids, function(id) {
+      rat  <- get_ratio(id, min_frames)
+      r    <- d[d$id == id, ]
+      data.frame(
+        drop_id    = id,
+        phase      = r$phase,
+        position   = seq_along(rat),
+        ratio      = rat,
+        background = background[seq_along(rat)],
+        sbr        = rat - background[seq_along(rat)]
+      )
+    })
+    sig_df <- do.call(rbind, sig_list)
+
+    list(
+      sig_df     = sig_df,
+      background = background,
+      min_frames = min_frames,
+      pre_ids    = pre_ids,
+      sig_ids    = sig_ids,
+      error      = NULL
+    )
+  })
+
+  # ── SBR results UI ────────────────────────────────────────────────────────
+  output$sbr_results_ui <- renderUI({
+    res <- sbr_result()
+    if (is.null(res)) return(tags$p(style="color:#888;margin-top:10px;",
+                                    "Configure settings and click Compute SBR."))
+    if (!is.null(res$error))
+      return(div(style="background:#fdecea;border-left:3px solid #c0392b;
+                        padding:10px 14px;font-size:12px;color:#7a1a1a;",
+                 res$error))
+    tagList(
+      tags$p(style="font-size:11px;color:#888;margin-bottom:4px;",
+        sprintf("All droplets cropped to %d frames (shortest selected droplet).",
+                res$min_frames)),
+      plotOutput("sbr_plot", height="420px"),
+      br(),
+      h4("SBR values table"),
+      DTOutput("sbr_table"),
+      br(),
+      downloadButton("dl_sbr", "Download SBR CSV", class="btn-success")
+    )
+  })
+
+  # ── SBR plot ──────────────────────────────────────────────────────────────
+  output$sbr_plot <- renderPlot({
+    res <- sbr_result(); req(res, is.null(res$error))
+    sig_df <- res$sig_df
+    phase_cols <- c(pre="#185FA5", stim="#c47d00", post="#27ae60")
+
+    # label each drop nicely
+    sig_df$label <- sapply(seq_len(nrow(sig_df)), function(i) {
+      ph  <- sig_df$phase[i]
+      id  <- sig_df$drop_id[i]
+      switch(ph,
+        pre  = sprintf("Pre-stim %d", id),
+        stim = sprintf("Stimulus %d", id),
+        post = sprintf("Post-stim %d", id),
+        sprintf("Drop %d", id))
+    })
+    sig_df$drop_fac <- factor(sig_df$drop_id)
+
+    ggplot(sig_df, aes(x=position, y=sbr, color=phase, group=drop_fac)) +
+      geom_line(linewidth=0.9) +
+      geom_point(size=1.5, alpha=0.8) +
+      geom_hline(yintercept=0, linetype="dashed", color="grey60", linewidth=0.6) +
+      scale_color_manual(values=phase_cols,
+        labels=c(pre="Pre-stim", stim="Stimulus", post="Post-stim"), name=NULL) +
+      theme_minimal(base_size=12) +
+      theme(
+        panel.grid.minor = element_blank(),
+        panel.grid.major = element_line(color="grey92"),
+        axis.title       = element_text(size=11, color="grey40"),
+        legend.position  = "top",
+        plot.title       = element_text(size=12, face="plain", color="grey35")
+      ) +
+      labs(x="Frame position within droplet", y="SBR  (ratio − background)",
+           title="Signal-to-Background Ratio — background subtracted")
+  }, res=110)
+
+  # ── SBR table ─────────────────────────────────────────────────────────────
+  output$sbr_table <- renderDT({
+    res <- sbr_result(); req(res, is.null(res$error))
+    d <- res$sig_df
+    d$phase <- factor(d$phase,
+      levels=c("pre","stim","post"),
+      labels=c("Pre-stim","Stimulus","Post-stim"))
+    d$ratio      <- round(d$ratio,      6)
+    d$background <- round(d$background, 6)
+    d$sbr        <- round(d$sbr,        6)
+    datatable(d[, c("drop_id","phase","position","ratio","background","sbr")],
+      rownames=FALSE,
+      options=list(dom="tp", pageLength=20, scrollX=TRUE, tabIndex=-1),
+      colnames=c("Drop ID","Phase","Position","Ratio (H)","Background (X)","SBR (Y–AE)"))
+  })
+
+  # ── SBR download ──────────────────────────────────────────────────────────
+  output$dl_sbr <- downloadHandler(
+    filename = function()
+      paste0(tools::file_path_sans_ext(basename(input$file$name)), "_SBR.csv"),
+    content = function(file) {
+      res <- sbr_result(); req(res, is.null(res$error))
+      d <- res$sig_df
+      d$phase <- ifelse(d$phase=="pre","Pre-stim",
+                 ifelse(d$phase=="stim","Stimulus","Post-stim"))
+      write.csv(d[, c("drop_id","phase","position","ratio","background","sbr")],
+                file, row.names=FALSE)
+    }
+  )
+
+  output$has_sbr <- reactive({
+    res <- tryCatch(sbr_result(), error=function(e) NULL)
+    !is.null(res) && is.null(res$error)
+  })
+  outputOptions(output, "has_sbr", suspendWhenHidden=FALSE)
+
+  # ── SBR boxplot ───────────────────────────────────────────────────────────
+  output$sbr_boxplot <- renderPlot({
+    res <- sbr_result(); req(res, is.null(res$error))
+    sig_df <- res$sig_df
+    phase_cols <- c(pre="#185FA5", stim="#c47d00", post="#27ae60")
+
+    drop_labels <- unique(sig_df[, c("drop_id","phase")])
+    drop_labels <- drop_labels[order(drop_labels$drop_id), ]
+    drop_labels$label <- mapply(function(id, ph) {
+      switch(ph, pre=sprintf("Pre %d",id), stim=sprintf("Stim %d",id),
+             post=sprintf("Post %d",id), sprintf("Drop %d",id))
+    }, drop_labels$drop_id, drop_labels$phase)
+
+    sig_df$label <- drop_labels$label[match(sig_df$drop_id, drop_labels$drop_id)]
+    sig_df$label <- factor(sig_df$label, levels=drop_labels$label)
+
+    # significance stars from Wilcoxon
+    st <- sbr_stats()
+    star_df <- NULL
+    if (!is.null(st)) {
+      star_df <- merge(st[, c("drop_id","sig")], drop_labels, by="drop_id")
+      star_df$y <- sapply(star_df$drop_id, function(id)
+        max(sig_df$sbr[sig_df$drop_id == id], na.rm=TRUE))
+      star_df$y <- star_df$y + 0.005
+    }
+
+    p <- ggplot(sig_df, aes(x=label, y=sbr, fill=phase)) +
+      geom_boxplot(outlier.size=1.5, outlier.alpha=0.6, width=0.55) +
+      geom_hline(yintercept=0, linetype="dashed", color="grey50", linewidth=0.6) +
+      scale_fill_manual(values=phase_cols,
+        labels=c(pre="Pre-stim", stim="Stimulus", post="Post-stim"), name=NULL) +
+      theme_minimal(base_size=13) +
+      theme(
+        panel.grid.minor   = element_blank(),
+        panel.grid.major.x = element_blank(),
+        axis.title         = element_text(size=11, color="grey40"),
+        legend.position    = "top",
+        plot.title         = element_text(size=13, face="plain", color="grey35")
+      ) +
+      labs(x="Droplet", y="SBR  (ratio − background)",
+           title="SBR by droplet  —  * p<0.05  ** p<0.01  *** p<0.001 vs Stimulus (Wilcoxon, BH)")
+
+    if (!is.null(star_df) && nrow(star_df) > 0)
+      p <- p + geom_text(data=star_df,
+                  aes(x=label, y=y, label=sig),
+                  inherit.aes=FALSE, size=4, color="#333333", vjust=0)
+    p
+  }, res=110)
+
+  # ── SBR stats helper ──────────────────────────────────────────────────────
+  sbr_stats <- reactive({
+    res <- tryCatch(sbr_result(), error=function(e) NULL)
+    if (is.null(res) || !is.null(res$error)) return(NULL)
+    sig_df <- res$sig_df
+
+    # find stimulus droplet(s)
+    stim_ids <- unique(sig_df$drop_id[sig_df$phase == "stim"])
+    if (length(stim_ids) == 0) return(NULL)
+    stim_sbr <- sig_df$sbr[sig_df$drop_id == stim_ids[1]]
+
+    # all other droplets
+    other_ids <- unique(sig_df$drop_id[sig_df$drop_id != stim_ids[1]])
+    if (length(other_ids) == 0) return(NULL)
+
+    results <- do.call(rbind, lapply(other_ids, function(id) {
+      ph  <- unique(sig_df$phase[sig_df$drop_id == id])
+      lbl <- switch(ph,
+        pre  = sprintf("Pre %d",  id),
+        post = sprintf("Post %d", id),
+        sprintf("Drop %d", id))
+      other_sbr <- sig_df$sbr[sig_df$drop_id == id]
+      wt <- tryCatch(
+        wilcox.test(other_sbr, stim_sbr, exact=FALSE),
+        error=function(e) list(statistic=NA, p.value=NA)
+      )
+      data.frame(
+        drop_id   = id,
+        label     = lbl,
+        phase     = ph,
+        n         = length(other_sbr),
+        median    = round(median(other_sbr), 6),
+        stim_median = round(median(stim_sbr), 6),
+        W         = if (!is.na(wt$p.value)) round(wt$statistic, 1) else NA,
+        p_value   = wt$p.value,
+        stringsAsFactors = FALSE
+      )
+    }))
+
+    # BH correction
+    results$p_adj <- p.adjust(results$p_value, method="BH")
+    results$sig   <- ifelse(is.na(results$p_adj), "",
+                     ifelse(results$p_adj < 0.001, "***",
+                     ifelse(results$p_adj < 0.01,  "**",
+                     ifelse(results$p_adj < 0.05,  "*", "ns"))))
+    results$direction <- ifelse(is.na(results$p_adj) | results$p_adj >= 0.05, "",
+                         ifelse(results$median > results$stim_median,
+                                "Higher than Stimulus", "Lower than Stimulus"))
+    results
+  })
+
+  # ── SBR stats table ───────────────────────────────────────────────────────
+  output$sbr_stats_table <- renderDT({
+    st <- sbr_stats(); req(st)
+    st$phase   <- ifelse(st$phase=="pre","Pre-stim",
+                  ifelse(st$phase=="stim","Stimulus","Post-stim"))
+    st$p_value <- formatC(st$p_value, format="e", digits=3)
+    st$p_adj   <- formatC(st$p_adj,   format="e", digits=3)
+    datatable(
+      st[, c("label","phase","n","median","W","p_value","p_adj","sig","direction")],
+      rownames = FALSE,
+      options  = list(dom="t", pageLength=30, ordering=FALSE, tabIndex=-1),
+      colnames = c("Droplet","Phase","N frames","Median SBR",
+                   "W statistic","p-value","p-adj (BH)","Sig.","Direction")
+    ) |>
+      formatStyle("sig",
+        color = styleEqual(c("***","**","*","ns",""),
+                           c("#c0392b","#c0392b","#e67e22","#888","#888")),
+        fontWeight = "bold") |>
+      formatStyle("direction",
+        color = styleEqual(c("Higher than Stimulus","Lower than Stimulus",""),
+                           c("#27ae60","#2c6fad","#888")),
+        fontWeight = "bold")
+  })
+
+  # ── SBR stats download ────────────────────────────────────────────────────
+  output$dl_sbr_stats <- downloadHandler(
+    filename = function()
+      paste0(tools::file_path_sans_ext(basename(input$file$name)), "_SBR_stats.csv"),
+    content = function(file) {
+      st <- sbr_stats(); req(st)
+      write.csv(st[, c("label","phase","n","median","W","p_value","p_adj","sig","direction")],
+                file, row.names=FALSE)
+    }
+  )
+
+  # ── SBR plot download ─────────────────────────────────────────────────────
+  output$dl_sbr_plot <- downloadHandler(
+    filename = function()
+      paste0(tools::file_path_sans_ext(basename(input$file$name)), "_SBR_boxplot.png"),
+    content = function(file) {
+      res <- sbr_result(); req(res, is.null(res$error))
+      sig_df <- res$sig_df
+      phase_cols <- c(pre="#185FA5", stim="#c47d00", post="#27ae60")
+      drop_labels <- unique(sig_df[, c("drop_id","phase")])
+      drop_labels <- drop_labels[order(drop_labels$drop_id), ]
+      drop_labels$label <- mapply(function(id, ph) {
+        switch(ph, pre=sprintf("Pre %d",id), stim=sprintf("Stim %d",id),
+               post=sprintf("Post %d",id), sprintf("Drop %d",id))
+      }, drop_labels$drop_id, drop_labels$phase)
+      sig_df$label <- drop_labels$label[match(sig_df$drop_id, drop_labels$drop_id)]
+      sig_df$label <- factor(sig_df$label, levels=drop_labels$label)
+
+      st <- sbr_stats()
+      star_df <- NULL
+      if (!is.null(st)) {
+        star_df <- merge(st[, c("drop_id","sig")], drop_labels, by="drop_id")
+        star_df$y <- sapply(star_df$drop_id, function(id)
+          max(sig_df$sbr[sig_df$drop_id == id], na.rm=TRUE)) + 0.005
+      }
+
+      p <- ggplot(sig_df, aes(x=label, y=sbr, fill=phase)) +
+        geom_boxplot(outlier.size=1.5, outlier.alpha=0.6, width=0.55) +
+        geom_hline(yintercept=0, linetype="dashed", color="grey50", linewidth=0.6) +
+        scale_fill_manual(values=phase_cols,
+          labels=c(pre="Pre-stim", stim="Stimulus", post="Post-stim"), name=NULL) +
+        theme_minimal(base_size=13) +
+        theme(panel.grid.minor=element_blank(), panel.grid.major.x=element_blank(),
+              axis.title=element_text(size=11,color="grey40"), legend.position="top",
+              plot.title=element_text(size=13,face="plain",color="grey35")) +
+        labs(x="Droplet", y="SBR  (ratio − background)",
+             title="SBR by droplet  —  * p<0.05  ** p<0.01  *** p<0.001 vs Stimulus (Wilcoxon, BH)")
+      if (!is.null(star_df) && nrow(star_df) > 0)
+        p <- p + geom_text(data=star_df, aes(x=label, y=y, label=sig),
+                    inherit.aes=FALSE, size=4, color="#333333", vjust=0)
+      ggsave(file, plot=p, width=8, height=5, dpi=150)
+    }
+  )
+
+  # ── Cleaned data reactive ──────────────────────────────────────────────────
+  cleaned_df <- reactive({
+    req(rv$df, rv$drops)
+    d  <- rv$drops[rv$drops$phase != "excluded", ]
+    if (nrow(d) == 0) return(NULL)
+    df <- rv$df
+    do.call(rbind, lapply(seq_len(nrow(d)), function(i) {
+      rows <- df[df$frame >= d$start_frame[i] & df$frame <= d$end_frame[i], ]
+      if (nrow(rows) == 0) return(NULL)
+      rows$phase   <- d$phase[i]
+      rows$drop_id <- d$id[i]
+      rows
+    }))
+  })
+
+  # ── Cleaned data plot ──────────────────────────────────────────────────────
+  output$plot_cleaned <- renderPlot({
+    cd <- cleaned_df(); req(cd)
+    phase_cols <- c(pre="#185FA5", stim="#c47d00", post="#27ae60")
+    cd$phase <- factor(cd$phase, levels=c("pre","stim","post"))
+
+    # build segments — break line between non-adjacent droplets
+    cd <- cd[order(cd$frame), ]
+    cd$drop_id <- factor(cd$drop_id)
+
+    ggplot(cd, aes(x=frame, y=intensity, color=phase, group=drop_id)) +
+      geom_line(linewidth=0.8) +
+      scale_color_manual(
+        values = phase_cols,
+        labels = c(pre="Pre-stim", stim="Stimulus", post="Post-stim"),
+        name   = NULL
+      ) +
+      theme_minimal(base_size=12) +
+      theme(
+        panel.grid.minor = element_blank(),
+        panel.grid.major = element_line(color="grey92"),
+        axis.title       = element_text(size=11, color="grey40"),
+        legend.position  = "top",
+        plot.title       = element_text(size=12, face="plain", color="grey35")
+      ) +
+      labs(x="Frame", y="Mean grey intensity",
+           title="Cleaned data — included droplets only")
+  }, res=110)
+
+  # ── Cleaned data table ─────────────────────────────────────────────────────
+  output$cleaned_table <- renderDT({
+    cd <- cleaned_df(); req(cd)
+    cd_show <- cd[, c("drop_id","phase","frame","intensity")]
+    cd_show$phase <- factor(cd_show$phase,
+      levels=c("pre","stim","post"),
+      labels=c("Pre-stim","Stimulus","Post-stim"))
+    cd_show <- cd_show[order(cd_show$frame), ]
+    datatable(cd_show, rownames=FALSE,
+      options=list(dom="tp", pageLength=15, scrollX=TRUE, tabIndex=-1),
+      colnames=c("Drop ID","Phase","Frame","Intensity"))
+  })
+
+  # ── Oxygen status ──────────────────────────────────────────────────────────
+  output$oxy_status <- renderUI({
+    req(rv$oxy_df)
+    n <- nrow(rv$oxy_df)
+    if (n == 0) return(tags$p(style="font-size:12px;color:#888;margin-top:4px;",
+                              "No oxygen blocks detected."))
+    total <- sum(rv$oxy_df$end_frame - rv$oxy_df$start_frame + 1)
+    tags$p(style="margin-top:6px;font-size:12px;color:#555;",
+      tags$span(class="oxy-pill", paste0(n, " O\u2082 blocks")),
+      sprintf(" — %d frames removed", total))
+  })
+
+  # ── JS view range ──────────────────────────────────────────────────────────
+  observeEvent(input$js_view, {
+    req(rv$df)
+    lo <- max(rv$frame_min, input$js_view$lo)
+    hi <- min(rv$frame_max, input$js_view$hi)
+    if (hi - lo >= 10) { rv$view_lo <- lo; rv$view_hi <- hi }
+  })
+
+  # ── Reset zoom ─────────────────────────────────────────────────────────────
+  observeEvent(input$reset_zoom, {
+    req(rv$df)
+    rv$view_lo <- rv$frame_min; rv$view_hi <- rv$frame_max
+    session$sendCustomMessage("caInit",
+      list(mn=rv$frame_min,mx=rv$frame_max,lo=rv$frame_min,hi=rv$frame_max))
+  })
+
+  # ── View info ──────────────────────────────────────────────────────────────
+  output$view_info <- renderUI({
+    req(rv$df)
+    span <- rv$view_hi - rv$view_lo
+    pct  <- round(100*span/(rv$frame_max - rv$frame_min))
+    tags$small(style="color:#888;",
+      sprintf("frames %d–%d (%d%%)", round(rv$view_lo), round(rv$view_hi), pct))
+  })
+
+  # ── Helper: add region from current brush ─────────────────────────────────
+  # ── Add via button ─────────────────────────────────────────────────────────
+  observeEvent(input$add_region, {
+    req(rv$df, input$brush)
+    sf <- round(input$brush$xmin); ef <- round(input$brush$xmax)
+    if (is.null(sf) || is.null(ef) || sf >= ef) return()
+    rv$drops <- rbind(rv$drops, data.frame(
+      id=rv$next_id, start_frame=sf, end_frame=ef,
+      n_frames=as.integer(ef-sf+1), phase="pre",
+      stringsAsFactors=FALSE))
+    rv$drops  <- auto_assign_phases(rv$drops)
+    rv$next_id <- rv$next_id + 1L
+    session$sendCustomMessage("clearBrush", list())
+  })
+
+  # ── Escape: deselect ──────────────────────────────────────────────────────
+  observeEvent(input$escape_key, { rv$selected_id <- NULL })
+
+  # ── Undo / clear ──────────────────────────────────────────────────────────
+  observeEvent(input$undo_last, {
+    if (nrow(rv$drops) > 0) {
+      last_id <- rv$drops$id[nrow(rv$drops)]
+      if (!is.null(rv$selected_id) && rv$selected_id == last_id)
+        rv$selected_id <- NULL
+      rv$drops <- rv$drops[-nrow(rv$drops),]
+    }
+  })
+  observeEvent(input$clear_drops, {
+    rv$drops <- rv$drops[0,]; rv$next_id <- 1L; rv$selected_id <- NULL
+  })
+
+  # ── Select a drop row ─────────────────────────────────────────────────────
+  observeEvent(input$click_drop_id, {
+    req(rv$df)
+    cid <- input$click_drop_id
+    if (!is.null(rv$selected_id) && rv$selected_id == cid) {
+      rv$selected_id <- NULL   # click again to deselect
+    } else {
+      rv$selected_id <- cid
+      # zoom to this region with padding
+      r   <- rv$drops[rv$drops$id == cid, ]
+      if (nrow(r) == 0) return()
+      span <- r$end_frame - r$start_frame
+      pad  <- max(span * 0.5, 30)
+      lo   <- max(rv$frame_min, r$start_frame - pad)
+      hi   <- min(rv$frame_max, r$end_frame   + pad)
+      rv$view_lo <- lo; rv$view_hi <- hi
+      session$sendCustomMessage("caInit",
+        list(mn=rv$frame_min, mx=rv$frame_max, lo=lo, hi=hi))
+    }
+  })
+
+  # ── Resize selected drop to current brush ─────────────────────────────────
+  observeEvent(input$resize_drop, {
+    req(rv$selected_id, input$brush)
+    sf <- round(input$brush$xmin); ef <- round(input$brush$xmax)
+    if (is.null(sf) || sf >= ef) return()
+    idx <- which(rv$drops$id == rv$selected_id)
+    if (length(idx) == 0) return()
+    rv$drops$start_frame[idx] <- sf
+    rv$drops$end_frame[idx]   <- ef
+    rv$drops$n_frames[idx]    <- as.integer(ef - sf + 1)
+    session$sendCustomMessage("clearBrush", list())
+  })
+
+  # ── Spacebar: single observer — resize if editing, else add new ───────────
+  observeEvent(input$space_add, {
+    req(rv$df, input$brush)
+    sf <- round(input$brush$xmin); ef <- round(input$brush$xmax)
+    if (is.null(sf) || is.null(ef) || sf >= ef) return()
+
+    if (!is.null(rv$selected_id)) {
+      # Editing an existing drop → resize it
+      idx <- which(rv$drops$id == rv$selected_id)
+      if (length(idx) > 0) {
+        rv$drops$start_frame[idx] <- sf
+        rv$drops$end_frame[idx]   <- ef
+        rv$drops$n_frames[idx]    <- as.integer(ef - sf + 1)
+      }
+    } else {
+      # No drop selected → add a new one
+      rv$drops <- rbind(rv$drops, data.frame(
+        id=rv$next_id, start_frame=sf, end_frame=ef,
+        n_frames=as.integer(ef-sf+1), phase="pre",
+        stringsAsFactors=FALSE))
+      rv$drops  <- auto_assign_phases(rv$drops)
+      rv$next_id <- rv$next_id + 1L
+    }
+    session$sendCustomMessage("clearBrush", list())
+  }, ignoreInit=TRUE)
+
+  # ── Delete selected drop ───────────────────────────────────────────────────
+  observeEvent(input$delete_drop, {
+    req(rv$selected_id)
+    rv$drops       <- rv$drops[rv$drops$id != rv$selected_id, ]
+    rv$selected_id <- NULL
+  })
+
+  # ── Deselect ──────────────────────────────────────────────────────────────
+  observeEvent(input$deselect_drop, { rv$selected_id <- NULL })
+
+  # ── Cycle phase on phase-pill click ───────────────────────────────────────
+  observeEvent(input$cycle_phase_id, {
+    req(rv$df)
+    cid <- input$cycle_phase_id
+    idx <- which(rv$drops$id == cid)
+    if (length(idx) == 0) return()
+    current <- rv$drops$phase[idx]
+    next_phase <- switch(current,
+      pre      = "stim",
+      stim     = "post",
+      post     = "excluded",
+      excluded = "pre",
+      "pre"
+    )
+    rv$drops$phase[idx] <- next_phase
+  })
+
+  # ── Main plot ──────────────────────────────────────────────────────────────
+  output$plot_main <- renderPlot({
+    req(rv$df, rv$oxy_df)
+    lo <- rv$view_lo; hi <- rv$view_hi
+    pad  <- (hi - lo) * 0.02
+    df_z <- rv$df[rv$df$frame >= (lo-pad) & rv$df$frame <= (hi+pad), ]
+
+    p <- ggplot(df_z, aes(x=frame, y=intensity)) +
+      coord_cartesian(xlim=c(lo, hi), expand=FALSE) +
+      theme_minimal(base_size=12) +
+      theme(
+        panel.grid.minor = element_blank(),
+        panel.grid.major = element_line(color="grey92"),
+        axis.title       = element_text(size=11, color="grey40"),
+        plot.title       = element_text(size=12, face="plain", color="grey35")
+      ) +
+      labs(x="Frame", y="Mean grey intensity",
+           title=paste0(basename(input$file$name),
+                        "  ·  frames ", round(lo), "–", round(hi)))
+
+    # Oxygen — amber
+    if (!is.null(rv$oxy_df) && nrow(rv$oxy_df) > 0) {
+      for (i in seq_len(nrow(rv$oxy_df))) {
+        o <- rv$oxy_df[i,]
+        p <- p + annotate("rect", xmin=o$start_frame, xmax=o$end_frame,
+                   ymin=-Inf, ymax=Inf, fill="#ba7517", alpha=0.20)
+        mid <- (o$start_frame + o$end_frame) / 2
+        if (mid >= lo && mid <= hi)
+          p <- p + annotate("text", x=mid, y=Inf, vjust=1.5, size=2.8,
+                     label="O\u2082", color="#7a4e00", fontface="bold")
+      }
+    }
+
+    # Droplets — colored by phase; selected one gets stronger fill + border
+    if (nrow(rv$drops) > 0) {
+      sel <- rv$selected_id
+      for (i in seq_len(nrow(rv$drops))) {
+        d      <- rv$drops[i,]
+        is_sel <- !is.null(sel) && !is.na(sel) && d$id == sel
+        ph     <- if (!is.null(d$phase) && nzchar(d$phase)) d$phase else "pre"
+        pcol   <- phase_color(ph)
+        palpha <- if (is_sel) 0.42 else switch(ph, excluded=0.10, 0.22)
+        p <- p + annotate("rect", xmin=d$start_frame, xmax=d$end_frame,
+                   ymin=-Inf, ymax=Inf, fill=pcol, alpha=palpha)
+        if (is_sel)
+          p <- p + annotate("rect", xmin=d$start_frame, xmax=d$end_frame,
+                     ymin=-Inf, ymax=Inf, fill=NA, color=pcol, linewidth=1.4)
+        mid <- (d$start_frame + d$end_frame) / 2
+        if (mid >= lo && mid <= hi) {
+          lbl <- switch(ph,
+            pre      = sprintf("Pre %d", d$id),
+            stim     = sprintf("Stim %d", d$id),
+            post     = sprintf("Post %d", d$id),
+            excluded = sprintf("X %d", d$id),
+            sprintf("%d", d$id)
+          )
+          if (is_sel) lbl <- paste0("▲ ", lbl)
+          p <- p + annotate("text", x=mid, y=Inf, vjust=1.5, size=2.8,
+                     label=lbl, color=pcol, fontface="bold")
+        }
+      }
+    }
+
+    p + geom_line(color="#185FA5", linewidth=0.7)
+  }, res=110)
+
+  # ── Region table ───────────────────────────────────────────────────────────
+  output$region_table_ui <- renderUI({
+    req(rv$df)
+    d   <- rv$drops
+    sel <- rv$selected_id
+
+    if (nrow(d) == 0)
+      return(tags$p(style="color:#888;font-size:12px;",
+                    "No droplet regions marked yet."))
+
+    d_sorted <- d[order(d$start_frame), ]
+
+    rows <- lapply(seq_len(nrow(d_sorted)), function(i) {
+      r      <- d_sorted[i,]
+      is_sel <- !is.null(sel) && !is.na(sel) && r$id == sel
+      ph     <- if (!is.null(r$phase) && nzchar(r$phase)) r$phase else "pre"
+      pcol   <- phase_color(ph)
+      pill_label <- switch(ph, pre="Pre-stim", stim="Stimulus", post="Post-stim", excluded="Excluded", ph)
+      tags$tr(
+        class   = if(is_sel) "drop-row selected" else "drop-row",
+        onclick = sprintf(
+          "Shiny.setInputValue('click_drop_id',%d,{priority:'event'})", r$id),
+        tags$td(style="padding:4px 10px 4px 0; color:#999; font-size:11px;", r$id),
+        tags$td(style="padding:4px 10px 4px 0;",
+          tags$span(
+            style=sprintf(
+              "background:%s;color:white;padding:1px 8px;border-radius:3px;font-size:11px;font-weight:500;cursor:pointer;",
+              pcol),
+            onclick=sprintf(
+              "event.stopPropagation();Shiny.setInputValue('cycle_phase_id',%d,{priority:'event'})",
+              r$id),
+            title="Click to cycle phase",
+            pill_label
+          )
+        ),
+        tags$td(style="padding:4px 10px 4px 0;", r$start_frame),
+        tags$td(style="padding:4px 10px 4px 0;", r$end_frame),
+        tags$td(style="padding:4px 10px 4px 0;", r$n_frames),
+        tags$td(style="padding:4px 4px 4px 0; color:#2c6fad; font-size:11px;",
+                if(is_sel) "▲ editing" else "edit")
+      )
+    })
+
+    tbl <- tags$table(
+      style="border-collapse:collapse;font-size:12px;width:auto;",
+      tags$thead(tags$tr(lapply(
+        c("ID","","Start","End","# frames",""), function(h)
+          tags$th(style="text-align:left;padding:4px 10px 4px 0;
+                         border-bottom:1px solid #ccc; color:#666;", h)
+      ))),
+      tags$tbody(rows)
+    )
+
+    # ── Edit panel ────────────────────────────────────────────────────────
+    edit_ui <- NULL
+    if (!is.null(sel) && !is.na(sel) && sel %in% d$id) {
+      r <- d[d$id == sel, ]
+      edit_ui <- div(class="edit-panel",
+        div(class="edit-title",
+            sprintf("✏  Editing Drop %d", r$id)),
+        div(class="edit-frames",
+            sprintf("frames  %d – %d  (%d frames)", r$start_frame, r$end_frame, r$n_frames)),
+        div(class="edit-hint",
+          "Drag a new selection on the plot, then press ",
+          tags$b("Space"), " or click ", tags$b("Resize"),
+          " to update the boundaries."
+        ),
+        fluidRow(
+          column(4,
+            actionButton("resize_drop","↔ Resize to selection",
+                         class="btn-primary btn-sm", width="100%")),
+          column(3,
+            actionButton("delete_drop","🗑 Delete",
+                         class="btn-danger btn-sm", width="100%")),
+          column(3,
+            actionButton("deselect_drop","✕ Done",
+                         class="btn-default btn-sm", width="100%"))
+        )
+      )
+    }
+
+    tagList(tbl, edit_ui)
+  })
+
+  # ── Summary table ──────────────────────────────────────────────────────────
+  output$summary_table <- renderDT({
+    req(rv$df)
+    d <- rv$drops
+    if (nrow(d) == 0)
+      return(datatable(data.frame(message="No droplet regions marked yet."),
+                       options=list(dom="t", tabIndex=-1), rownames=FALSE))
+    df <- rv$df
+    win_df <- do.call(rbind, lapply(seq_len(nrow(d)), function(i) {
+      w <- df[df$frame >= d$start_frame[i] & df$frame <= d$end_frame[i], ]
+      if (nrow(w) == 0) return(NULL)
+      data.frame(
+        window         = paste0("Drop ", d$id[i]),
+        start_frame    = w$frame[1],
+        end_frame      = w$frame[nrow(w)],
+        n_frames       = nrow(w),
+        mean_intensity = round(mean(w$intensity), 2),
+        sd_intensity   = round(sd(w$intensity),   2),
+        min_intensity  = round(min(w$intensity),  2),
+        max_intensity  = round(max(w$intensity),  2)
+      )
+    }))
+    if (is.null(win_df) || nrow(win_df) == 0)
+      return(datatable(data.frame(message="No frames in marked regions.")))
+    datatable(win_df, rownames=FALSE,
+              options=list(dom="tp", pageLength=20, scrollX=TRUE,
+                           keys=FALSE, tabIndex=-1),
+              colnames=c("Window","Start","End","# frames","Mean","SD","Min","Max"))
+  })
+
+  # ── Downloads ──────────────────────────────────────────────────────────────
+  output$dl_cleaned <- downloadHandler(
+    filename = function()
+      paste0(tools::file_path_sans_ext(basename(input$file$name)), "_droplets_data.csv"),
+    content = function(file) {
+      req(rv$df)
+      d <- rv$drops; df <- rv$df
+      if (nrow(d) == 0) { write.csv(data.frame(), file, row.names=FALSE); return() }
+      keep <- rep(FALSE, nrow(df))
+      for (i in seq_len(nrow(d)))
+        keep <- keep | (df$frame >= d$start_frame[i] & df$frame <= d$end_frame[i])
+      write.csv(df[keep, c("frame","intensity")], file, row.names=FALSE)
+    }
+  )
+  output$dl_regions <- downloadHandler(
+    filename = function()
+      paste0(tools::file_path_sans_ext(basename(input$file$name)), "_droplet_regions.csv"),
+    content = function(file)
+      write.csv(rv$drops[, c("id","start_frame","end_frame","n_frames")],
+                file, row.names=FALSE)
+  )
+}
+
+shinyApp(ui, server)
+```
+

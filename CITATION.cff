@@ -1,0 +1,43 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+title: "CalciumImage: Calcium imaging analysis for microfluidic SCN explant culture"
+abstract: >-
+  An R Shiny pipeline for analyzing calcium imaging data from prairie vole
+  suprachiasmatic nucleus (SCN) explants cultured on a 3D-printed bubble
+  perfusion microfluidic chip. Handles import of raw Calbryte 520 AM
+  fluorescence traces, interactive removal of oxygen bubble artifacts,
+  one-phase exponential photobleaching correction, and frame-level Wilcoxon
+  rank-sum testing with Benjamini-Hochberg FDR correction.
+type: software
+authors:
+  - given-names: Richard
+    family-names: Ortiz
+    email: rortiz@niu.edu
+    affiliation: "Northern Illinois University, Department of Psychology"
+    orcid: "https://orcid.org/0000-0002-1209-9744"
+version: 2.0.0
+date-released: "2026-08-12"
+license: MIT
+repository-code: "https://github.com/richard-ortiz/cal.image"
+keywords:
+  - calcium-imaging
+  - suprachiasmatic-nucleus
+  - prairie-vole
+  - microfluidics
+  - photobleaching-correction
+  - shiny
+  - neuroscience
+
+# When the associated paper is published, uncomment and fill this in.
+# GitHub and Zenodo will then point people at the paper rather than the
+# software as the preferred citation.
+#
+# preferred-citation:
+#   type: article
+#   title: ""
+#   authors:
+#     - given-names: Richard
+#       family-names: Ortiz
+#   journal: ""
+#   year:
+#   doi: ""

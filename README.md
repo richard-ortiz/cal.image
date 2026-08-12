@@ -8,3 +8,5 @@ Manual artifact exclusion — Interactive frame-level exclusion of frames affect
 Photobleaching correction — Fits a one-phase exponential decay model to baseline fluorescence and corrects traces accordingly.
 Statistical testing — Performs frame-level Wilcoxon rank-sum tests between experimental conditions, with Benjamini-Hochberg false discovery rate (FDR) correction for multiple comparisons.
 Output — Generates corrected traces and summary statistics for figure generation.
+
+V2. Allows for raw SBR data exporting for various modes of graphical analysis

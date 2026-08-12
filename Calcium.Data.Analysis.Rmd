@@ -1,5 +1,3 @@
-```{r helpers, include=FALSE}
-knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
 
 # =============================================================================
 # Calcium Imaging — Droplet Selector
@@ -553,7 +551,9 @@ ui <- fluidPage(
               br(),
               downloadButton("dl_sbr_plot",  "Download plot (PNG)", class="btn-success"),
               tags$span(style="display:inline-block;width:10px;"),
-              downloadButton("dl_sbr_stats", "Download stats CSV",  class="btn-success")
+              downloadButton("dl_sbr_stats", "Download stats CSV",  class="btn-success"),
+              tags$span(style="display:inline-block;width:10px;"),
+              downloadButton("dl_sbr_wide",  "Download raw SBR values (wide)", class="btn-success")
             ),
 
             conditionalPanel("!output.has_sbr",
@@ -1163,6 +1163,34 @@ server <- function(input, output, session) {
     }
   )
 
+  # ── SBR wide-format download ───────────────────────────────────────────────
+  output$dl_sbr_wide <- downloadHandler(
+    filename = function()
+      paste0(tools::file_path_sans_ext(basename(input$file$name)), "_SBR_wide.csv"),
+    content = function(file) {
+      res <- sbr_result(); req(res, is.null(res$error))
+      sig_df <- res$sig_df
+
+      # build label per drop (same as boxplot)
+      drop_labels <- unique(sig_df[, c("drop_id","phase")])
+      drop_labels <- drop_labels[order(drop_labels$drop_id), ]
+      drop_labels$label <- mapply(function(id, ph) {
+        switch(ph, pre=sprintf("Pre %d",id), stim=sprintf("Stim %d",id),
+               post=sprintf("Post %d",id), sprintf("Drop %d",id))
+      }, drop_labels$drop_id, drop_labels$phase)
+
+      # pivot to wide: one column per droplet, rows = frame position
+      wide <- do.call(cbind, lapply(seq_len(nrow(drop_labels)), function(i) {
+        id  <- drop_labels$drop_id[i]
+        lbl <- drop_labels$label[i]
+        vals <- sig_df$sbr[sig_df$drop_id == id]
+        setNames(data.frame(vals), lbl)
+      }))
+
+      write.csv(wide, file, row.names=FALSE)
+    }
+  )
+
   # ── Cleaned data reactive ──────────────────────────────────────────────────
   cleaned_df <- reactive({
     req(rv$df, rv$drops)
@@ -1579,5 +1607,3 @@ server <- function(input, output, session) {
 }
 
 shinyApp(ui, server)
-```
-

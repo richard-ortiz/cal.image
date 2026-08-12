@@ -9,29 +9,5 @@ Photobleaching correction — Fits a one-phase exponential decay model to baseli
 Statistical testing — Performs frame-level Wilcoxon rank-sum tests between experimental conditions, with Benjamini-Hochberg false discovery rate (FDR) correction for multiple comparisons.
 Output — Generates corrected traces and summary statistics for figure generation.
 
-cff-version: 1.2.0
-message: "If you use this software, please cite it as below."
-title: "DEXCHAT: Dextran and Chitosan Solution Calculator"
-abstract: >-
-  A Shiny application that computes the solvent volumes required to dissolve
-  given masses of chitosan and dextran to their target working concentrations.
-type: software
-authors:
-  - given-names: Richard
-    family-names: Ortiz
-    email: rortiz@niu.edu
-    affiliation: "Northern Illinois University, Department of Psychology"
-    # orcid: "https://orcid.org/0000-0000-0000-0000"
-version: 1.0.0
-date-released: "2026-08-12"
-license: MIT
-repository-code: "https://github.com/richard-ortiz/dexchat"
-keywords:
-  - chitosan
-  - dextran
-  - shiny
-  - laboratory-calculator
-  - reproducible-research
-
 
 V2. Allows for raw SBR data exporting for various modes of graphical analysis
